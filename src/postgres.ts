@@ -1,5 +1,5 @@
 import { Pool, PoolClient, PoolConfig } from 'pg';
-import { getLogger } from '@kitiumai/logger';
+import { createLogger } from '@kitiumai/logger';
 import { InternalError } from '@kitiumai/error';
 import { nanoid } from 'nanoid';
 import type {
@@ -22,7 +22,7 @@ import type {
   SSOSession,
 } from '@kitiumai/auth';
 
-const logger = getLogger();
+const logger = createLogger();
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type DbRecord = Record<string, any>;
 
