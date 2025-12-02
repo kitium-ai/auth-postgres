@@ -2,6 +2,7 @@ import { Pool, PoolClient, PoolConfig } from 'pg';
 import { getLogger } from '@kitiumai/logger';
 import { InternalError } from '@kitiumai/error';
 import { generateId, generateApiKey, hashApiKey } from '@kitiumai/auth/utils';
+import { setTimeout as delay } from 'timers/promises';
 import type {
   StorageAdapter,
   ApiKeyRecord,
@@ -25,22 +26,36 @@ import type {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type DbRecord = Record<string, any>;
 
+type QueryOptions = {
+  operation?: string;
+  timeoutMs?: number;
+  retries?: number;
+};
+
+type PostgresAdapterOptions = PoolConfig & {
+  statementTimeoutMs?: number;
+  maxRetries?: number;
+};
+
 export class PostgresStorageAdapter implements StorageAdapter {
   private pool: Pool;
-  private client: PoolClient | undefined;
   private readonly logger = getLogger();
+  private readonly defaultQueryTimeoutMs: number;
+  private readonly defaultRetries: number;
 
-  constructor(connectionString: string, options?: PoolConfig) {
+  constructor(connectionString: string, options?: PostgresAdapterOptions) {
+    const { statementTimeoutMs, maxRetries, ...poolOptions } = options ?? {};
     this.pool = new Pool({
       connectionString,
-      ...(options ?? {}),
+      ...(poolOptions ?? {}),
     });
+    this.defaultQueryTimeoutMs = statementTimeoutMs ?? 5_000;
+    this.defaultRetries = maxRetries ?? 2;
   }
 
   async connect(): Promise<void> {
     try {
-      this.client = await this.pool.connect();
-      await this.initializeTables();
+      await this.runMigrations();
       this.logger.info('PostgreSQL adapter connected successfully');
     } catch (error) {
       this.logger.error('Failed to connect to PostgreSQL', { error });
@@ -62,10 +77,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   async disconnect(): Promise<void> {
     try {
-      if (this.client) {
-        this.client.release();
-        this.client = undefined;
-      }
       await this.pool.end();
       this.logger.info('PostgreSQL adapter disconnected');
     } catch (error) {
@@ -80,7 +91,104 @@ export class PostgresStorageAdapter implements StorageAdapter {
     }
   }
 
-  private async initializeTables(): Promise<void> {
+  private async withClient<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      return await fn(client);
+    } finally {
+      client.release();
+    }
+  }
+
+  private async query<T extends DbRecord = DbRecord>(
+    text: string,
+    values: unknown[] = [],
+    options?: QueryOptions
+  ) {
+    const retries = options?.retries ?? this.defaultRetries;
+    const timeoutMs = options?.timeoutMs ?? this.defaultQueryTimeoutMs;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        return await this.withClient(async client => {
+          const start = Date.now();
+          await client.query('BEGIN');
+
+          try {
+            if (timeoutMs) {
+              await client.query('SET LOCAL statement_timeout = $1', [timeoutMs]);
+            }
+
+            const result = await client.query<T>(text, values);
+            await client.query('COMMIT');
+
+            const durationMs = Date.now() - start;
+
+            this.logger.debug('postgres.query', {
+              operation: options?.operation,
+              durationMs,
+            });
+
+            return result;
+          } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+          }
+        });
+      } catch (error) {
+        lastError = error;
+        const retryable = attempt < retries;
+        this.logger.warn('PostgreSQL query failed', {
+          operation: options?.operation,
+          attempt,
+          retryable,
+          error,
+        });
+
+        if (!retryable) {
+          throw new InternalError({
+            code: 'auth-postgres/query_failed',
+            message: 'Failed to execute PostgreSQL query',
+            severity: 'error',
+            retryable: false,
+            cause: error,
+          });
+        }
+
+        await delay(50 * 2 ** attempt);
+      }
+    }
+
+    throw lastError;
+  }
+
+  async healthCheck(): Promise<{ status: 'ok' | 'error'; latencyMs: number }> {
+    const start = Date.now();
+    try {
+      await this.query('SELECT 1', [], { operation: 'health_check', retries: 0 });
+      return { status: 'ok', latencyMs: Date.now() - start };
+    } catch (error) {
+      this.logger.error('PostgreSQL health check failed', { error });
+      return { status: 'error', latencyMs: Date.now() - start };
+    }
+  }
+
+  private async runMigrations(): Promise<void> {
+    await this.query(
+      `CREATE TABLE IF NOT EXISTS auth_migrations (
+        id VARCHAR(255) PRIMARY KEY,
+        applied_at TIMESTAMP NOT NULL DEFAULT NOW()
+      )`
+    );
+
+    const migrationId = '0001_initial_schema_v2';
+    const existing = await this.query('SELECT id FROM auth_migrations WHERE id = $1', [migrationId]);
+
+    if (existing.rows.length > 0) {
+      return;
+    }
+
     const createTables = `
       -- Users table
       CREATE TABLE IF NOT EXISTS users (
@@ -91,33 +199,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
         plan VARCHAR(50) DEFAULT 'free',
         entitlements TEXT[] NOT NULL DEFAULT '{}',
         oauth JSONB DEFAULT '{}',
-        metadata JSONB DEFAULT '{}',
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-
-      -- API Keys table
-      CREATE TABLE IF NOT EXISTS api_keys (
-        id VARCHAR(255) PRIMARY KEY,
-        principal_id VARCHAR(255) NOT NULL,
-        hash VARCHAR(255) NOT NULL UNIQUE,
-        prefix VARCHAR(50) NOT NULL,
-        last_four VARCHAR(4) NOT NULL,
-        scopes TEXT[] NOT NULL DEFAULT '{}',
-        metadata JSONB DEFAULT '{}',
-        expires_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
-      );
-
-      -- Sessions table
-      CREATE TABLE IF NOT EXISTS sessions (
-        id VARCHAR(255) PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
-        org_id VARCHAR(255),
-        plan VARCHAR(50),
-        entitlements TEXT[] NOT NULL DEFAULT '{}',
-        expires_at TIMESTAMP NOT NULL,
         metadata JSONB DEFAULT '{}',
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
@@ -135,6 +216,35 @@ export class PostgresStorageAdapter implements StorageAdapter {
         updated_at TIMESTAMP DEFAULT NOW()
       );
 
+      -- API Keys table
+      CREATE TABLE IF NOT EXISTS api_keys (
+        id VARCHAR(255) PRIMARY KEY,
+        principal_id VARCHAR(255) NOT NULL,
+        hash VARCHAR(255) NOT NULL UNIQUE,
+        prefix VARCHAR(50) NOT NULL,
+        last_four VARCHAR(4) NOT NULL,
+        scopes TEXT[] NOT NULL DEFAULT '{}',
+        metadata JSONB DEFAULT '{}',
+        expires_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        CONSTRAINT fk_api_keys_principal_user FOREIGN KEY (principal_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      -- Sessions table
+      CREATE TABLE IF NOT EXISTS sessions (
+        id VARCHAR(255) PRIMARY KEY,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        org_id VARCHAR(255),
+        plan VARCHAR(50),
+        entitlements TEXT[] NOT NULL DEFAULT '{}',
+        expires_at TIMESTAMP NOT NULL,
+        metadata JSONB DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        CONSTRAINT fk_sessions_org FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE SET NULL
+      );
+
       -- Email Verification Tokens table
       CREATE TABLE IF NOT EXISTS email_verification_tokens (
         id VARCHAR(255) PRIMARY KEY,
@@ -146,7 +256,8 @@ export class PostgresStorageAdapter implements StorageAdapter {
         metadata JSONB DEFAULT '{}',
         expires_at TIMESTAMP NOT NULL,
         used_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT NOW()
+        created_at TIMESTAMP DEFAULT NOW(),
+        CONSTRAINT fk_email_verification_tokens_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
       );
 
       -- Email Verification Token Attempts table
@@ -168,7 +279,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       -- Roles table
       CREATE TABLE IF NOT EXISTS roles (
         id VARCHAR(255) PRIMARY KEY,
-        org_id VARCHAR(255) NOT NULL,
+        org_id VARCHAR(255) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
         name VARCHAR(255) NOT NULL,
         description TEXT,
         is_system BOOLEAN DEFAULT FALSE,
@@ -181,9 +292,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
       -- User Roles table
       CREATE TABLE IF NOT EXISTS user_roles (
         id VARCHAR(255) PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         role_id VARCHAR(255) NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-        org_id VARCHAR(255) NOT NULL,
+        org_id VARCHAR(255) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
         assigned_at TIMESTAMP DEFAULT NOW()
       );
 
@@ -214,13 +325,14 @@ export class PostgresStorageAdapter implements StorageAdapter {
         attribute_mapping JSONB DEFAULT '{}',
         metadata JSONB DEFAULT '{}',
         created_at TIMESTAMP DEFAULT NOW(),
-        updated_at TIMESTAMP DEFAULT NOW()
+        updated_at TIMESTAMP DEFAULT NOW(),
+        CONSTRAINT fk_sso_providers_org FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE SET NULL
       );
 
       -- SSO Links table
       CREATE TABLE IF NOT EXISTS sso_links (
         id VARCHAR(255) PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         provider_id VARCHAR(255) NOT NULL REFERENCES sso_providers(id) ON DELETE CASCADE,
         provider_type VARCHAR(50) NOT NULL,
         provider_subject VARCHAR(255) NOT NULL,
@@ -234,7 +346,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       -- SSO Sessions table
       CREATE TABLE IF NOT EXISTS sso_sessions (
         id VARCHAR(255) PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         provider_id VARCHAR(255) NOT NULL REFERENCES sso_providers(id) ON DELETE CASCADE,
         provider_type VARCHAR(50) NOT NULL,
         provider_subject VARCHAR(255) NOT NULL,
@@ -247,7 +359,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       -- 2FA Devices table
       CREATE TABLE IF NOT EXISTS twofa_devices (
         id VARCHAR(255) PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         method VARCHAR(50) NOT NULL,
         name VARCHAR(255),
         verified BOOLEAN DEFAULT FALSE,
@@ -262,7 +374,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       -- 2FA Backup Codes table
       CREATE TABLE IF NOT EXISTS twofa_backup_codes (
         id VARCHAR(255) PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         code VARCHAR(255) NOT NULL,
         used BOOLEAN DEFAULT FALSE,
         used_at TIMESTAMP,
@@ -272,9 +384,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
       -- 2FA Sessions table
       CREATE TABLE IF NOT EXISTS twofa_sessions (
         id VARCHAR(255) PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL,
+        user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         session_id VARCHAR(255) NOT NULL,
-        device_id VARCHAR(255) NOT NULL,
+        device_id VARCHAR(255) NOT NULL REFERENCES twofa_devices(id) ON DELETE CASCADE,
         method VARCHAR(50) NOT NULL,
         verification_code VARCHAR(10),
         attempt_count INTEGER DEFAULT 0,
@@ -309,9 +421,29 @@ export class PostgresStorageAdapter implements StorageAdapter {
       CREATE INDEX IF NOT EXISTS idx_twofa_backup_codes_user_id ON twofa_backup_codes(user_id);
       CREATE INDEX IF NOT EXISTS idx_twofa_sessions_user_id ON twofa_sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_twofa_sessions_session_id ON twofa_sessions(session_id);
+
+      -- Updated at trigger
+      CREATE OR REPLACE FUNCTION set_updated_at()
+      RETURNS TRIGGER AS $$
+      BEGIN
+        NEW.updated_at = NOW();
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DO $$
+      DECLARE
+        tbl TEXT;
+      BEGIN
+        FOR tbl IN SELECT UNNEST(ARRAY['users','api_keys','sessions','organizations','roles','twofa_devices']) LOOP
+          EXECUTE format('CREATE TRIGGER %I_set_updated_at BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION set_updated_at();', tbl, tbl);
+        END LOOP;
+      END;
+      $$;
     `;
 
-    await this.client!.query(createTables);
+    await this.query(createTables, [], { operation: 'migration:initial', timeoutMs: 30_000, retries: 0 });
+    await this.query('INSERT INTO auth_migrations (id) VALUES ($1)', [migrationId]);
   }
 
   private mapEmailVerificationToken(row: Record<string, unknown>): EmailVerificationToken {
@@ -379,13 +511,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       new Date(),
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapApiKeyRecord(result.rows[0]);
   }
 
   async getApiKey(id: string): Promise<ApiKeyRecord | null> {
     const query = 'SELECT * FROM api_keys WHERE id = $1';
-    const result = await this.client!.query(query, [id]);
+    const result = await this.query(query, [id]);
 
     if (result.rows.length === 0) {
       return null;
@@ -396,7 +528,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   async getApiKeyByHash(hash: string): Promise<ApiKeyRecord | null> {
     const query = 'SELECT * FROM api_keys WHERE hash = $1';
-    const result = await this.client!.query(query, [hash]);
+    const result = await this.query(query, [hash]);
 
     if (result.rows.length === 0) {
       return null;
@@ -407,7 +539,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   async getApiKeysByPrefixAndLastFour(prefix: string, lastFour: string): Promise<ApiKeyRecord[]> {
     const query = 'SELECT * FROM api_keys WHERE prefix = $1 AND last_four = $2';
-    const result = await this.client!.query(query, [prefix, lastFour]);
+    const result = await this.query(query, [prefix, lastFour]);
 
     return result.rows.map((row) => this.mapApiKeyRecord(row));
   }
@@ -462,18 +594,18 @@ export class PostgresStorageAdapter implements StorageAdapter {
       RETURNING *
     `;
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapApiKeyRecord(result.rows[0]);
   }
 
   async deleteApiKey(id: string): Promise<void> {
     const query = 'DELETE FROM api_keys WHERE id = $1';
-    await this.client!.query(query, [id]);
+    await this.query(query, [id]);
   }
 
   async listApiKeys(principalId: string): Promise<ApiKeyRecord[]> {
     const query = 'SELECT * FROM api_keys WHERE principal_id = $1 ORDER BY created_at DESC';
-    const result = await this.client!.query(query, [principalId]);
+    const result = await this.query(query, [principalId]);
 
     return result.rows.map((row) => this.mapApiKeyRecord(row));
   }
@@ -497,13 +629,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       new Date(),
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapSessionRecord(result.rows[0]);
   }
 
   async getSession(id: string): Promise<SessionRecord | null> {
     const query = 'SELECT * FROM sessions WHERE id = $1';
-    const result = await this.client!.query(query, [id]);
+    const result = await this.query(query, [id]);
 
     if (result.rows.length === 0) {
       return null;
@@ -562,13 +694,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       RETURNING *
     `;
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapSessionRecord(result.rows[0]);
   }
 
   async deleteSession(id: string): Promise<void> {
     const query = 'DELETE FROM sessions WHERE id = $1';
-    await this.client!.query(query, [id]);
+    await this.query(query, [id]);
   }
 
   // Organization methods
@@ -590,13 +722,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       JSON.stringify(data.metadata || {}),
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapOrganizationRecord(result.rows[0]);
   }
 
   async getOrganization(id: string): Promise<OrganizationRecord | null> {
     const query = 'SELECT * FROM organizations WHERE id = $1';
-    const result = await this.client!.query(query, [id]);
+    const result = await this.query(query, [id]);
 
     if (result.rows.length === 0) {
       return null;
@@ -648,13 +780,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       RETURNING *
     `;
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapOrganizationRecord(result.rows[0]);
   }
 
   async deleteOrganization(id: string): Promise<void> {
     const query = 'DELETE FROM organizations WHERE id = $1';
-    await this.client!.query(query, [id]);
+    await this.query(query, [id]);
   }
 
   // User methods
@@ -678,13 +810,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       JSON.stringify(data.metadata || {}),
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapUserRecord(result.rows[0]);
   }
 
   async getUser(id: string): Promise<UserRecord | null> {
     const query = 'SELECT * FROM users WHERE id = $1';
-    const result = await this.client!.query(query, [id]);
+    const result = await this.query(query, [id]);
 
     if (result.rows.length === 0) {
       return null;
@@ -695,7 +827,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   async getUserByEmail(email: string): Promise<UserRecord | null> {
     const query = 'SELECT * FROM users WHERE email = $1';
-    const result = await this.client!.query(query, [email]);
+    const result = await this.query(query, [email]);
 
     if (result.rows.length === 0) {
       return null;
@@ -710,7 +842,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       WHERE oauth->>$1 IS NOT NULL
         AND oauth->$1->>'sub' = $2
     `;
-    const result = await this.client!.query(query, [provider, sub]);
+    const result = await this.query(query, [provider, sub]);
 
     if (result.rows.length === 0) {
       return null;
@@ -753,13 +885,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       RETURNING *
     `;
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapUserRecord(result.rows[0]);
   }
 
   async deleteUser(id: string): Promise<void> {
     const query = 'DELETE FROM users WHERE id = $1';
-    await this.client!.query(query, [id]);
+    await this.query(query, [id]);
   }
 
   async linkOAuthAccount(
@@ -785,7 +917,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
     const values = [userId, `{${provider}}`, JSON.stringify(oauthData)];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapUserRecord(result.rows[0]);
   }
 
@@ -812,7 +944,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       data.expiresAt,
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapEmailVerificationToken(result.rows[0]);
   }
 
@@ -830,13 +962,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
     query += ' ORDER BY created_at DESC';
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return result.rows.map((row: DbRecord) => this.mapEmailVerificationToken(row));
   }
 
   async getEmailVerificationTokenById(id: string): Promise<EmailVerificationToken | null> {
     const query = 'SELECT * FROM email_verification_tokens WHERE id = $1';
-    const result = await this.client!.query(query, [id]);
+    const result = await this.query(query, [id]);
 
     if (result.rows.length === 0) {
       return null;
@@ -853,19 +985,19 @@ export class PostgresStorageAdapter implements StorageAdapter {
       RETURNING *
     `;
 
-    const result = await this.client!.query(query, [id]);
+    const result = await this.query(query, [id]);
     return this.mapEmailVerificationToken(result.rows[0]);
   }
 
   async deleteExpiredEmailVerificationTokens(): Promise<number> {
     const query = 'DELETE FROM email_verification_tokens WHERE expires_at < NOW()';
-    const result = await this.client!.query(query);
+    const result = await this.query(query);
     return result.rowCount || 0;
   }
 
   async getEmailVerificationTokenAttempts(tokenId: string): Promise<number> {
     const query = 'SELECT attempts FROM email_verification_token_attempts WHERE token_id = $1';
-    const result = await this.client!.query(query, [tokenId]);
+    const result = await this.query(query, [tokenId]);
 
     if (result.rows.length === 0) {
       return 0;
@@ -883,7 +1015,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       RETURNING attempts
     `;
 
-    const result = await this.client!.query(query, [tokenId]);
+    const result = await this.query(query, [tokenId]);
     return result.rows[0].attempts;
   }
 
@@ -902,7 +1034,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       event.timestamp,
     ];
 
-    await this.client!.query(query, values);
+    await this.query(query, values);
   }
 
   // RBAC methods
@@ -925,13 +1057,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       JSON.stringify(data.metadata || {}),
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapRoleRecord(result.rows[0]);
   }
 
   async getRole(roleId: string): Promise<RoleRecord | null> {
     const query = 'SELECT * FROM roles WHERE id = $1';
-    const result = await this.client!.query(query, [roleId]);
+    const result = await this.query(query, [roleId]);
 
     if (result.rows.length === 0) {
       return null;
@@ -986,18 +1118,18 @@ export class PostgresStorageAdapter implements StorageAdapter {
       RETURNING *
     `;
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapRoleRecord(result.rows[0]);
   }
 
   async deleteRole(roleId: string): Promise<void> {
     const query = 'DELETE FROM roles WHERE id = $1';
-    await this.client!.query(query, [roleId]);
+    await this.query(query, [roleId]);
   }
 
   async listRoles(orgId: string): Promise<RoleRecord[]> {
     const query = 'SELECT * FROM roles WHERE org_id = $1 ORDER BY created_at DESC';
-    const result = await this.client!.query(query, [orgId]);
+    const result = await this.query(query, [orgId]);
 
     return result.rows.map((row) => this.mapRoleRecord(row));
   }
@@ -1012,7 +1144,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const values = [id, userId, roleId, orgId];
-    await this.client!.query(query, values);
+    await this.query(query, values);
 
     const role = await this.getRole(roleId);
     if (!role) {
@@ -1029,7 +1161,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   async revokeRoleFromUser(userId: string, roleId: string, orgId: string): Promise<void> {
     const query = 'DELETE FROM user_roles WHERE user_id = $1 AND role_id = $2 AND org_id = $3';
-    await this.client!.query(query, [userId, roleId, orgId]);
+    await this.query(query, [userId, roleId, orgId]);
   }
 
   async getUserRoles(userId: string, orgId: string): Promise<RoleRecord[]> {
@@ -1040,7 +1172,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       WHERE ur.user_id = $1 AND ur.org_id = $2
       ORDER BY r.created_at DESC
     `;
-    const result = await this.client!.query(query, [userId, orgId]);
+    const result = await this.query(query, [userId, orgId]);
 
     return result.rows.map((row) => this.mapRoleRecord(row));
   }
@@ -1088,13 +1220,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       JSON.stringify(data.metadata || {}),
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapSSOProviderRecord(result.rows[0]);
   }
 
   async getSSOProvider(providerId: string): Promise<unknown | null> {
     const query = 'SELECT * FROM sso_providers WHERE id = $1';
-    const result = await this.client!.query(query, [providerId]);
+    const result = await this.query(query, [providerId]);
 
     if (result.rows.length === 0) {
       return null;
@@ -1139,13 +1271,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       RETURNING *
     `;
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapSSOProviderRecord(result.rows[0]);
   }
 
   async deleteSSOProvider(providerId: string): Promise<void> {
     const query = 'DELETE FROM sso_providers WHERE id = $1';
-    await this.client!.query(query, [providerId]);
+    await this.query(query, [providerId]);
   }
 
   async listSSOProviders(orgId?: string): Promise<unknown[]> {
@@ -1159,7 +1291,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
     query += ' ORDER BY created_at DESC';
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return result.rows.map((row) => this.mapSSOProviderRecord(row));
   }
 
@@ -1187,13 +1319,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       data.lastAuthAt || new Date(),
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapSSOLinkRecord(result.rows[0]);
   }
 
   async getSSOLink(linkId: string): Promise<SSOLink | null> {
     const query = 'SELECT * FROM sso_links WHERE id = $1';
-    const result = await this.client!.query(query, [linkId]);
+    const result = await this.query(query, [linkId]);
 
     if (result.rows.length === 0) {
       return null;
@@ -1204,14 +1336,14 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   async getUserSSOLinks(userId: string): Promise<SSOLink[]> {
     const query = 'SELECT * FROM sso_links WHERE user_id = $1 ORDER BY linked_at DESC';
-    const result = await this.client!.query(query, [userId]);
+    const result = await this.query(query, [userId]);
 
     return result.rows.map((row) => this.mapSSOLinkRecord(row));
   }
 
   async deleteSSOLink(linkId: string): Promise<void> {
     const query = 'DELETE FROM sso_links WHERE id = $1';
-    await this.client!.query(query, [linkId]);
+    await this.query(query, [linkId]);
   }
 
   async createSSOSession(data: Omit<SSOSession, 'id' | 'linkedAt'>): Promise<SSOSession> {
@@ -1237,13 +1369,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       data.lastAuthAt || new Date(),
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapSSOSessionRecord(result.rows[0]);
   }
 
   async getSSOSession(sessionId: string): Promise<SSOSession | null> {
     const query = 'SELECT * FROM sso_sessions WHERE id = $1';
-    const result = await this.client!.query(query, [sessionId]);
+    const result = await this.query(query, [sessionId]);
 
     if (result.rows.length === 0) {
       return null;
@@ -1277,13 +1409,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       JSON.stringify(data.metadata || {}),
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapTwoFactorDeviceRecord(result.rows[0]);
   }
 
   async getTwoFactorDevice(deviceId: string): Promise<TwoFactorDevice | null> {
     const query = 'SELECT * FROM twofa_devices WHERE id = $1';
-    const result = await this.client!.query(query, [deviceId]);
+    const result = await this.query(query, [deviceId]);
 
     if (result.rows.length === 0) {
       return null;
@@ -1294,7 +1426,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   async listTwoFactorDevices(userId: string): Promise<TwoFactorDevice[]> {
     const query = 'SELECT * FROM twofa_devices WHERE user_id = $1 ORDER BY created_at DESC';
-    const result = await this.client!.query(query, [userId]);
+    const result = await this.query(query, [userId]);
 
     return result.rows.map((row) => this.mapTwoFactorDeviceRecord(row));
   }
@@ -1348,13 +1480,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       RETURNING *
     `;
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapTwoFactorDeviceRecord(result.rows[0]);
   }
 
   async deleteTwoFactorDevice(deviceId: string): Promise<void> {
     const query = 'DELETE FROM twofa_devices WHERE id = $1';
-    await this.client!.query(query, [deviceId]);
+    await this.query(query, [deviceId]);
   }
 
   async createBackupCodes(userId: string, codes: BackupCode[]): Promise<BackupCode[]> {
@@ -1372,7 +1504,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       const codeValue = typeof codeData === 'string' ? codeData : codeData.code || '';
       const values = [id, userId, codeValue, false];
 
-      const result = await this.client!.query(query, values);
+      const result = await this.query(query, values);
       createdCodes.push(this.mapBackupCodeRecord(result.rows[0]));
     }
 
@@ -1381,7 +1513,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   async getBackupCodes(userId: string): Promise<BackupCode[]> {
     const query = 'SELECT * FROM twofa_backup_codes WHERE user_id = $1 ORDER BY created_at DESC';
-    const result = await this.client!.query(query, [userId]);
+    const result = await this.query(query, [userId]);
 
     return result.rows.map((row) => this.mapBackupCodeRecord(row));
   }
@@ -1392,7 +1524,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       SET used = TRUE, used_at = NOW()
       WHERE id = $1
     `;
-    await this.client!.query(query, [codeId]);
+    await this.query(query, [codeId]);
   }
 
   async createTwoFactorSession(data: TwoFactorSession): Promise<TwoFactorSession> {
@@ -1419,13 +1551,13 @@ export class PostgresStorageAdapter implements StorageAdapter {
       data.expiresAt,
     ];
 
-    const result = await this.client!.query(query, values);
+    const result = await this.query(query, values);
     return this.mapTwoFactorSessionRecord(result.rows[0]);
   }
 
   async getTwoFactorSession(sessionId: string): Promise<TwoFactorSession | null> {
     const query = 'SELECT * FROM twofa_sessions WHERE id = $1';
-    const result = await this.client!.query(query, [sessionId]);
+    const result = await this.query(query, [sessionId]);
 
     if (result.rows.length === 0) {
       return null;
@@ -1440,7 +1572,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       SET completed_at = NOW()
       WHERE id = $1
     `;
-    await this.client!.query(query, [sessionId]);
+    await this.query(query, [sessionId]);
   }
 
   // Helper methods
