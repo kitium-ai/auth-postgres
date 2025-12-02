@@ -3,6 +3,7 @@
   "compilerOptions": {
     "outDir": "./dist",
     "baseUrl": "./src",
+    "moduleResolution": "bundler",
     "exactOptionalPropertyTypes": false,
     "noPropertyAccessFromIndexSignature": false,
     "paths": {

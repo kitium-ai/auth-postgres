@@ -103,12 +103,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kitium-ai/auth-postgres.git",
-    "directory": "packages/auth-postgres"
+    "url": "git+https://github.com/kitium-ai/auth-postgres.git"
   },
   "bugs": {
     "url": "https://github.com/kitium-ai/auth-postgres/issues"
   },
+  "homepage": "https://github.com/kitium-ai/auth-postgres#readme",
   "engines": {
     "node": ">=16.0.0"
   },
@@ -117,19 +117,18 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@kitiumai/auth": "^3.0.3",
+    "@kitiumai/auth": "^4.0.1",
     "pg": "^8.10.0",
-    "nanoid": "^5.0.4",
-    "@kitiumai/logger": "^2.0.0",
-    "@kitiumai/types": "^2.0.0",
-    "@kitiumai/utils-ts": "^2.0.1",
-    "@kitiumai/error": "^2.0.0"
+    "@kitiumai/logger": "^2.0.1",
+    "@kitiumai/types": "^2.0.1",
+    "@kitiumai/utils-ts": "^2.0.2",
+    "@kitiumai/error": "^2.0.1"
   },
   "devDependencies": {
-    "@kitiumai/config": "^2.0.0",
-    "@kitiumai/lint": "^2.0.0",
+    "@kitiumai/config": "^2.0.1",
+    "@kitiumai/lint": "^2.0.1",
     "@kitiumai/scripts": "^1.0.0",
-    "@kitiumai/vitest-helpers": "^2.0.0",
+    "@kitiumai/vitest-helpers": "^2.0.1",
     "@types/node": "^20.6.0",
     "@types/pg": "^8.10.7",
     "@vitest/coverage-v8": "^2.1.3",
@@ -137,7 +136,7 @@
     "rimraf": "^5.0.5",
     "tsup": "7.2.0",
     "typescript": "^5.2.2",
-    "vitest": "^2.0.0"
+    "vitest": "^2.1.8"
   },
   "pnpm": {
     "overrides": {

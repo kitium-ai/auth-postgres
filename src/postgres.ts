@@ -1,7 +1,7 @@
 import { Pool, PoolClient, PoolConfig } from 'pg';
-import { createLogger } from '@kitiumai/logger';
+import { getLogger } from '@kitiumai/logger';
 import { InternalError } from '@kitiumai/error';
-import { nanoid } from 'nanoid';
+import { generateId, generateApiKey, hashApiKey } from '@kitiumai/auth/utils';
 import type {
   StorageAdapter,
   ApiKeyRecord,
@@ -22,13 +22,13 @@ import type {
   SSOSession,
 } from '@kitiumai/auth';
 
-const logger = createLogger();
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type DbRecord = Record<string, any>;
 
 export class PostgresStorageAdapter implements StorageAdapter {
   private pool: Pool;
   private client: PoolClient | undefined;
+  private readonly logger = getLogger();
 
   constructor(connectionString: string, options?: PoolConfig) {
     this.pool = new Pool({
@@ -41,9 +41,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
     try {
       this.client = await this.pool.connect();
       await this.initializeTables();
-      logger.info('PostgreSQL adapter connected successfully');
+      this.logger.info('PostgreSQL adapter connected successfully');
     } catch (error) {
-      logger.error('Failed to connect to PostgreSQL', { error });
+      this.logger.error('Failed to connect to PostgreSQL', { error });
       throw new InternalError({
         code: 'auth-postgres/connection_failed',
         message: 'Failed to connect to PostgreSQL',
@@ -67,9 +67,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
         this.client = undefined;
       }
       await this.pool.end();
-      logger.info('PostgreSQL adapter disconnected');
+      this.logger.info('PostgreSQL adapter disconnected');
     } catch (error) {
-      logger.error('Error disconnecting from PostgreSQL', { error });
+      this.logger.error('Error disconnecting from PostgreSQL', { error });
       throw new InternalError({
         code: 'auth-postgres/disconnect_failed',
         message: 'Failed to disconnect from PostgreSQL',
@@ -329,8 +329,38 @@ export class PostgresStorageAdapter implements StorageAdapter {
     };
   }
 
+  /**
+   * Create an API key with plaintext secret (convenience method)
+   * @param principalId - Principal ID for the key
+   * @param scopes - Scopes for the key
+   * @param prefix - Optional prefix (default: 'api')
+   * @returns Object with the record and plaintext key
+   */
+  async createApiKeyWithSecret(
+    principalId: string,
+    scopes: string[],
+    prefix: string = 'api'
+  ): Promise<{ record: ApiKeyRecord; key: string }> {
+    const key = generateApiKey(prefix);
+    const hash = hashApiKey(key);
+    const parts = key.split('_');
+    const lastFour = parts[parts.length - 1]!.slice(-4);
+
+    const record = await this.createApiKey({
+      principalId,
+      hash,
+      prefix,
+      lastFour,
+      scopes,
+    });
+
+    return { record, key };
+  }
+
   // API Key methods
-  async createApiKey(data: Omit<ApiKeyRecord, 'id' | 'createdAt'>): Promise<ApiKeyRecord> {
+  async createApiKey(
+    data: Omit<ApiKeyRecord, 'id' | 'createdAt' | 'updatedAt'>
+  ): Promise<ApiKeyRecord> {
     const query = `
       INSERT INTO api_keys (id, principal_id, hash, prefix, last_four, scopes, metadata, expires_at, updated_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -338,7 +368,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const values = [
-      this.generateId(),
+      generateId(),
       data['principalId'],
       data['hash'],
       data['prefix'],
@@ -457,7 +487,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const values = [
-      this.generateId(),
+      generateId(),
       data.userId,
       data.orgId || null,
       data.plan || null,
@@ -552,7 +582,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const values = [
-      this.generateId(),
+      generateId(),
       data.name,
       data.plan,
       data.seats,
@@ -629,7 +659,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   // User methods
   async createUser(data: CreateUserInput): Promise<UserRecord> {
-    const id = nanoid();
+    const id = generateId();
 
     const query = `
       INSERT INTO users (id, email, name, picture, plan, entitlements, oauth, metadata)
@@ -763,7 +793,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
   async createEmailVerificationToken(
     data: Omit<EmailVerificationToken, 'id'>
   ): Promise<EmailVerificationToken> {
-    const id = nanoid();
+    const id = generateId();
 
     const query = `
       INSERT INTO email_verification_tokens (id, email, code, code_hash, type, user_id, metadata, expires_at)
@@ -877,7 +907,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   // RBAC methods
   async createRole(data: Omit<RoleRecord, 'id' | 'createdAt' | 'updatedAt'>): Promise<RoleRecord> {
-    const id = nanoid();
+    const id = generateId();
 
     const query = `
       INSERT INTO roles (id, org_id, name, description, is_system, permissions, metadata)
@@ -973,7 +1003,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
   }
 
   async assignRoleToUser(userId: string, roleId: string, orgId: string): Promise<RoleRecord> {
-    const id = nanoid();
+    const id = generateId();
 
     const query = `
       INSERT INTO user_roles (id, user_id, role_id, org_id)
@@ -1017,7 +1047,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
 
   // SSO methods
   async createSSOProvider(data: DbRecord): Promise<unknown> {
-    const id = nanoid();
+    const id = generateId();
 
     const query = `
       INSERT INTO sso_providers (
@@ -1134,7 +1164,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
   }
 
   async createSSOLink(data: Omit<SSOLink, 'id' | 'linkedAt'>): Promise<SSOLink> {
-    const id = nanoid();
+    const id = generateId();
 
     const query = `
       INSERT INTO sso_links (
@@ -1185,7 +1215,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
   }
 
   async createSSOSession(data: Omit<SSOSession, 'id' | 'linkedAt'>): Promise<SSOSession> {
-    const id = nanoid();
+    const id = generateId();
 
     const query = `
       INSERT INTO sso_sessions (
@@ -1226,7 +1256,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
   async createTwoFactorDevice(
     data: Omit<TwoFactorDevice, 'id' | 'createdAt'>
   ): Promise<TwoFactorDevice> {
-    const id = nanoid();
+    const id = generateId();
 
     const query = `
       INSERT INTO twofa_devices (
@@ -1331,7 +1361,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
     const createdCodes: BackupCode[] = [];
 
     for (const codeData of codes) {
-      const id = nanoid();
+      const id = generateId();
 
       const query = `
         INSERT INTO twofa_backup_codes (id, user_id, code, used)
@@ -1366,7 +1396,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
   }
 
   async createTwoFactorSession(data: TwoFactorSession): Promise<TwoFactorSession> {
-    const id = nanoid();
+    const id = generateId();
 
     const query = `
       INSERT INTO twofa_sessions (
@@ -1414,10 +1444,6 @@ export class PostgresStorageAdapter implements StorageAdapter {
   }
 
   // Helper methods
-  private generateId(): string {
-    return nanoid();
-  }
-
   private mapApiKeyRecord(row: DbRecord): ApiKeyRecord {
     // Parse metadata from JSONB if it's a string
     let metadata: Record<string, string> = {};

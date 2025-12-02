@@ -7,19 +7,11 @@ export default defineConfig({
     ...baseConfig.test,
     globals: true,
     environment: 'node',
-    exclude: [
-      '**/node_modules/**',
-      '**/dist/**',
-    ],
+    exclude: ['**/node_modules/**', '**/dist/**'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html'],
-      exclude: [
-        '**/*.test.ts',
-        '**/*.spec.ts',
-        'dist/**',
-        'node_modules/**',
-      ],
+      exclude: ['**/*.test.ts', '**/*.spec.ts', 'dist/**', 'node_modules/**'],
     },
   },
 });
