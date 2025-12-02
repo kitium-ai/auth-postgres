@@ -2,7 +2,7 @@ import { Pool, PoolClient, PoolConfig } from 'pg';
 import { getLogger } from '@kitiumai/logger';
 import { InternalError } from '@kitiumai/error';
 import { generateId, generateApiKey, hashApiKey } from '@kitiumai/auth/utils';
-import { setTimeout as delay } from 'timers/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import type {
   StorageAdapter,
   ApiKeyRecord,
@@ -104,14 +104,14 @@ export class PostgresStorageAdapter implements StorageAdapter {
     text: string,
     values: unknown[] = [],
     options?: QueryOptions
-  ) {
+  ): Promise<{ rows: T[]; rowCount: number | null }> {
     const retries = options?.retries ?? this.defaultRetries;
     const timeoutMs = options?.timeoutMs ?? this.defaultQueryTimeoutMs;
     let lastError: unknown;
 
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       try {
-        return await this.withClient(async client => {
+        return await this.withClient(async (client) => {
           const start = Date.now();
           await client.query('BEGIN');
 
@@ -183,7 +183,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
     );
 
     const migrationId = '0001_initial_schema_v2';
-    const existing = await this.query('SELECT id FROM auth_migrations WHERE id = $1', [migrationId]);
+    const existing = await this.query('SELECT id FROM auth_migrations WHERE id = $1', [
+      migrationId,
+    ]);
 
     if (existing.rows.length > 0) {
       return;
@@ -442,7 +444,11 @@ export class PostgresStorageAdapter implements StorageAdapter {
       $$;
     `;
 
-    await this.query(createTables, [], { operation: 'migration:initial', timeoutMs: 30_000, retries: 0 });
+    await this.query(createTables, [], {
+      operation: 'migration:initial',
+      timeoutMs: 30_000,
+      retries: 0,
+    });
     await this.query('INSERT INTO auth_migrations (id) VALUES ($1)', [migrationId]);
   }
 
@@ -512,7 +518,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapApiKeyRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create API key',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapApiKeyRecord(result.rows[0]!);
   }
 
   async getApiKey(id: string): Promise<ApiKeyRecord | null> {
@@ -523,7 +537,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapApiKeyRecord(result.rows[0]);
+    return this.mapApiKeyRecord(result.rows[0]!);
   }
 
   async getApiKeyByHash(hash: string): Promise<ApiKeyRecord | null> {
@@ -534,14 +548,16 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapApiKeyRecord(result.rows[0]);
+    return this.mapApiKeyRecord(result.rows[0]!);
   }
 
   async getApiKeysByPrefixAndLastFour(prefix: string, lastFour: string): Promise<ApiKeyRecord[]> {
     const query = 'SELECT * FROM api_keys WHERE prefix = $1 AND last_four = $2';
     const result = await this.query(query, [prefix, lastFour]);
 
-    return result.rows.map((row) => this.mapApiKeyRecord(row));
+    return result.rows
+      .filter((row): row is DbRecord => !!row)
+      .map((row) => this.mapApiKeyRecord(row));
   }
 
   async updateApiKey(id: string, data: Partial<ApiKeyRecord>): Promise<ApiKeyRecord> {
@@ -595,7 +611,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const result = await this.query(query, values);
-    return this.mapApiKeyRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/update_failed',
+        message: 'Failed to update API key',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapApiKeyRecord(result.rows[0]!);
   }
 
   async deleteApiKey(id: string): Promise<void> {
@@ -607,7 +631,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
     const query = 'SELECT * FROM api_keys WHERE principal_id = $1 ORDER BY created_at DESC';
     const result = await this.query(query, [principalId]);
 
-    return result.rows.map((row) => this.mapApiKeyRecord(row));
+    return result.rows
+      .filter((row): row is DbRecord => !!row)
+      .map((row) => this.mapApiKeyRecord(row));
   }
 
   // Session methods
@@ -630,7 +656,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapSessionRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create session',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapSessionRecord(result.rows[0]!);
   }
 
   async getSession(id: string): Promise<SessionRecord | null> {
@@ -641,7 +675,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapSessionRecord(result.rows[0]);
+    return this.mapSessionRecord(result.rows[0]!);
   }
 
   async updateSession(id: string, data: Partial<SessionRecord>): Promise<SessionRecord> {
@@ -695,7 +729,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const result = await this.query(query, values);
-    return this.mapSessionRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/update_failed',
+        message: 'Failed to update session',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapSessionRecord(result.rows[0]!);
   }
 
   async deleteSession(id: string): Promise<void> {
@@ -723,7 +765,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapOrganizationRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create organization',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapOrganizationRecord(result.rows[0]!);
   }
 
   async getOrganization(id: string): Promise<OrganizationRecord | null> {
@@ -734,7 +784,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapOrganizationRecord(result.rows[0]);
+    return this.mapOrganizationRecord(result.rows[0]!);
   }
 
   async updateOrganization(
@@ -781,7 +831,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const result = await this.query(query, values);
-    return this.mapOrganizationRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/update_failed',
+        message: 'Failed to update organization',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapOrganizationRecord(result.rows[0]!);
   }
 
   async deleteOrganization(id: string): Promise<void> {
@@ -811,7 +869,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapUserRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create user',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapUserRecord(result.rows[0]!);
   }
 
   async getUser(id: string): Promise<UserRecord | null> {
@@ -822,7 +888,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapUserRecord(result.rows[0]);
+    return this.mapUserRecord(result.rows[0]!);
   }
 
   async getUserByEmail(email: string): Promise<UserRecord | null> {
@@ -833,7 +899,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapUserRecord(result.rows[0]);
+    return this.mapUserRecord(result.rows[0]!);
   }
 
   async getUserByOAuth(provider: string, sub: string): Promise<UserRecord | null> {
@@ -848,7 +914,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapUserRecord(result.rows[0]);
+    return this.mapUserRecord(result.rows[0]!);
   }
 
   async updateUser(id: string, data: UpdateUserInput): Promise<UserRecord> {
@@ -886,7 +952,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const result = await this.query(query, values);
-    return this.mapUserRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/update_failed',
+        message: 'Failed to update user',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapUserRecord(result.rows[0]!);
   }
 
   async deleteUser(id: string): Promise<void> {
@@ -918,7 +992,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     const values = [userId, `{${provider}}`, JSON.stringify(oauthData)];
 
     const result = await this.query(query, values);
-    return this.mapUserRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/link_failed',
+        message: 'Failed to link OAuth account',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapUserRecord(result.rows[0]!);
   }
 
   // Email Verification Token methods
@@ -945,7 +1027,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapEmailVerificationToken(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create email verification token',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapEmailVerificationToken(result.rows[0]!);
   }
 
   async getEmailVerificationTokens(
@@ -963,7 +1053,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
     query += ' ORDER BY created_at DESC';
 
     const result = await this.query(query, values);
-    return result.rows.map((row: DbRecord) => this.mapEmailVerificationToken(row));
+    return result.rows
+      .filter((row): row is DbRecord => !!row)
+      .map((row) => this.mapEmailVerificationToken(row));
   }
 
   async getEmailVerificationTokenById(id: string): Promise<EmailVerificationToken | null> {
@@ -974,7 +1066,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapEmailVerificationToken(result.rows[0]);
+    return this.mapEmailVerificationToken(result.rows[0]!);
   }
 
   async markEmailVerificationTokenAsUsed(id: string): Promise<EmailVerificationToken> {
@@ -986,7 +1078,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const result = await this.query(query, [id]);
-    return this.mapEmailVerificationToken(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/update_failed',
+        message: 'Failed to mark email verification token as used',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapEmailVerificationToken(result.rows[0]!);
   }
 
   async deleteExpiredEmailVerificationTokens(): Promise<number> {
@@ -1003,7 +1103,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return 0;
     }
 
-    return result.rows[0].attempts;
+    return result.rows[0]!.attempts;
   }
 
   async incrementEmailVerificationTokenAttempts(tokenId: string): Promise<number> {
@@ -1016,7 +1116,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const result = await this.query(query, [tokenId]);
-    return result.rows[0].attempts;
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/update_failed',
+        message: 'Failed to increment token attempts',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return result.rows[0]!.attempts;
   }
 
   // Event methods
@@ -1058,7 +1166,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapRoleRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create role',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapRoleRecord(result.rows[0]!);
   }
 
   async getRole(roleId: string): Promise<RoleRecord | null> {
@@ -1069,7 +1185,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapRoleRecord(result.rows[0]);
+    return this.mapRoleRecord(result.rows[0]!);
   }
 
   async updateRole(roleId: string, data: Partial<RoleRecord>): Promise<RoleRecord> {
@@ -1119,7 +1235,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const result = await this.query(query, values);
-    return this.mapRoleRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/update_failed',
+        message: 'Failed to update role',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapRoleRecord(result.rows[0]!);
   }
 
   async deleteRole(roleId: string): Promise<void> {
@@ -1174,7 +1298,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
     const result = await this.query(query, [userId, orgId]);
 
-    return result.rows.map((row) => this.mapRoleRecord(row));
+    return result.rows
+      .filter((row): row is DbRecord => !!row)
+      .map((row) => this.mapRoleRecord(row));
   }
 
   // SSO methods
@@ -1221,7 +1347,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapSSOProviderRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create SSO provider',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapSSOProviderRecord(result.rows[0]!);
   }
 
   async getSSOProvider(providerId: string): Promise<unknown | null> {
@@ -1232,7 +1366,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapSSOProviderRecord(result.rows[0]);
+    return this.mapSSOProviderRecord(result.rows[0]!);
   }
 
   async updateSSOProvider(providerId: string, data: Partial<unknown>): Promise<unknown> {
@@ -1272,7 +1406,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const result = await this.query(query, values);
-    return this.mapSSOProviderRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/update_failed',
+        message: 'Failed to update SSO provider',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapSSOProviderRecord(result.rows[0]!);
   }
 
   async deleteSSOProvider(providerId: string): Promise<void> {
@@ -1292,7 +1434,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
     query += ' ORDER BY created_at DESC';
 
     const result = await this.query(query, values);
-    return result.rows.map((row) => this.mapSSOProviderRecord(row));
+    return result.rows
+      .filter((row): row is DbRecord => !!row)
+      .map((row) => this.mapSSOProviderRecord(row));
   }
 
   async createSSOLink(data: Omit<SSOLink, 'id' | 'linkedAt'>): Promise<SSOLink> {
@@ -1320,7 +1464,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapSSOLinkRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create SSO link',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapSSOLinkRecord(result.rows[0]!);
   }
 
   async getSSOLink(linkId: string): Promise<SSOLink | null> {
@@ -1331,14 +1483,16 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapSSOLinkRecord(result.rows[0]);
+    return this.mapSSOLinkRecord(result.rows[0]!);
   }
 
   async getUserSSOLinks(userId: string): Promise<SSOLink[]> {
     const query = 'SELECT * FROM sso_links WHERE user_id = $1 ORDER BY linked_at DESC';
     const result = await this.query(query, [userId]);
 
-    return result.rows.map((row) => this.mapSSOLinkRecord(row));
+    return result.rows
+      .filter((row): row is DbRecord => !!row)
+      .map((row) => this.mapSSOLinkRecord(row));
   }
 
   async deleteSSOLink(linkId: string): Promise<void> {
@@ -1370,7 +1524,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapSSOSessionRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create SSO session',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapSSOSessionRecord(result.rows[0]!);
   }
 
   async getSSOSession(sessionId: string): Promise<SSOSession | null> {
@@ -1381,7 +1543,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapSSOSessionRecord(result.rows[0]);
+    return this.mapSSOSessionRecord(result.rows[0]!);
   }
 
   // 2FA methods
@@ -1410,7 +1572,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapTwoFactorDeviceRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create two-factor device',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapTwoFactorDeviceRecord(result.rows[0]!);
   }
 
   async getTwoFactorDevice(deviceId: string): Promise<TwoFactorDevice | null> {
@@ -1421,14 +1591,16 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapTwoFactorDeviceRecord(result.rows[0]);
+    return this.mapTwoFactorDeviceRecord(result.rows[0]!);
   }
 
   async listTwoFactorDevices(userId: string): Promise<TwoFactorDevice[]> {
     const query = 'SELECT * FROM twofa_devices WHERE user_id = $1 ORDER BY created_at DESC';
     const result = await this.query(query, [userId]);
 
-    return result.rows.map((row) => this.mapTwoFactorDeviceRecord(row));
+    return result.rows
+      .filter((row): row is DbRecord => !!row)
+      .map((row) => this.mapTwoFactorDeviceRecord(row));
   }
 
   async updateTwoFactorDevice(
@@ -1481,7 +1653,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     `;
 
     const result = await this.query(query, values);
-    return this.mapTwoFactorDeviceRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/update_failed',
+        message: 'Failed to update two-factor device',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapTwoFactorDeviceRecord(result.rows[0]!);
   }
 
   async deleteTwoFactorDevice(deviceId: string): Promise<void> {
@@ -1505,7 +1685,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
       const values = [id, userId, codeValue, false];
 
       const result = await this.query(query, values);
-      createdCodes.push(this.mapBackupCodeRecord(result.rows[0]));
+      if (result.rows[0]) {
+        createdCodes.push(this.mapBackupCodeRecord(result.rows[0]));
+      }
     }
 
     return createdCodes;
@@ -1515,7 +1697,9 @@ export class PostgresStorageAdapter implements StorageAdapter {
     const query = 'SELECT * FROM twofa_backup_codes WHERE user_id = $1 ORDER BY created_at DESC';
     const result = await this.query(query, [userId]);
 
-    return result.rows.map((row) => this.mapBackupCodeRecord(row));
+    return result.rows
+      .filter((row): row is DbRecord => !!row)
+      .map((row) => this.mapBackupCodeRecord(row));
   }
 
   async markBackupCodeUsed(codeId: string): Promise<void> {
@@ -1552,7 +1736,15 @@ export class PostgresStorageAdapter implements StorageAdapter {
     ];
 
     const result = await this.query(query, values);
-    return this.mapTwoFactorSessionRecord(result.rows[0]);
+    if (!result.rows[0]) {
+      throw new InternalError({
+        code: 'auth-postgres/create_failed',
+        message: 'Failed to create two-factor session',
+        severity: 'error',
+        retryable: false,
+      });
+    }
+    return this.mapTwoFactorSessionRecord(result.rows[0]!);
   }
 
   async getTwoFactorSession(sessionId: string): Promise<TwoFactorSession | null> {
@@ -1563,7 +1755,7 @@ export class PostgresStorageAdapter implements StorageAdapter {
       return null;
     }
 
-    return this.mapTwoFactorSessionRecord(result.rows[0]);
+    return this.mapTwoFactorSessionRecord(result.rows[0]!);
   }
 
   async completeTwoFactorSession(sessionId: string): Promise<void> {

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [v3.1.1] - 2025-12-02
 
 - Add migration tracking table and enforce foreign keys across auth tables with automatic `updated_at` triggers.
 - Introduce per-query transactions with configurable statement timeouts, retries, and a built-in health check helper.
